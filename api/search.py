@@ -1,16 +1,17 @@
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query
-from database.database import VectorDB, get_session, SearchQuery
+from database.database import VectorDB, async_session, SearchQuery
 from database.database import SearchResult as ORMSearchResult
 from database.schemas import SearchRequest, SearchResult as SearchResultSchema
 from sqlalchemy import select, or_
 from typing import List, Dict, Any
-import openai
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, date
+import pandas as pd
 
 load_dotenv()
 
@@ -194,25 +195,128 @@ METRIC_SYNONYMS = {
     "qty": "quantity",
     "數量": "quantity",
     "量": "quantity",
-    "品質": "quality_score",
-    "質量": "quality_score",
-    "quality": "quality_score",
-    "score": "quality_score",
+    "品質": "整體滿意度",
+    "質量": "整體滿意度",
+    "quality": "整體滿意度",
+    "score": "整體滿意度",
+}
+
+# Ordinal words to numbers (EN + basic ZH via regex handled separately)
+ORDINAL_WORDS = {
+    'first': 1,
+    '1st': 1,
+    'second': 2,
+    '2nd': 2,
+    'third': 3,
+    '3rd': 3,
+    'fourth': 4,
+    '4th': 4,
+    'fifth': 5,
+    '5th': 5,
+    'sixth': 6,
+    '6th': 6,
+    'seventh': 7,
+    '7th': 7,
+    'eighth': 8,
+    '8th': 8,
+    'ninth': 9,
+    '9th': 9,
+    'tenth': 10,
+    '10th': 10,
 }
 
 # Mode synonyms for metric intent detection (EN + ZH)
 MODE_SYNONYMS = {
     'max': [
         'highest', 'maximum', 'max', 'maximize', 'top', 'best', 'largest',
-        'greatest', 'most', 'upper', 'peak', 'optimize', 'optimal', 'maximal',
-        '最高', '最大', '最多', '最佳', '最優', '最优', '最強', '最强'
+        'high', 'greatest', 'most', 'upper', 'peak', 'optimize', 'optimal',
+        'maximal', '最高', '最大', '最多', '最佳', '最優', '最优', '最強', '最强', '高'
     ],
     'min': [
         'lowest', 'minimum', 'min', 'minimize', 'least', 'smallest', 'minimal',
-        'lower', 'worst', 'bottom', 'mininal', 'minumal', '最低', '最小', '最少',
-        '最差', '最弱'
+        'low', 'lower', 'worst', 'bottom', 'mininal', 'minumal', '最低', '最小',
+        '最少', '最差', '最弱', '低'
     ],
 }
+
+# Country alias normalization for fuzzy matching (codes, English, and common CJK)
+COUNTRY_ALIAS_TO_CANON = {
+    # Japan
+    "jp": "jp",
+    "jpn": "jp",
+    "japan": "jp",
+    "日本": "jp",
+    "日本國": "jp",
+    "日本国": "jp",
+    # China (accept "ch" as an alias though ISO is "cn")
+    "cn": "cn",
+    "chn": "cn",
+    "china": "cn",
+    "ch": "cn",
+    "中國": "cn",
+    "中国": "cn",
+    # Taiwan
+    "tw": "tw",
+    "twn": "tw",
+    "taiwan": "tw",
+    "台灣": "tw",
+    "台湾": "tw",
+    # Korea (South)
+    "kr": "kr",
+    "kor": "kr",
+    "korea": "kr",
+    "south korea": "kr",
+    "ko": "kr",
+    "韓國": "kr",
+    "韩国": "kr",
+    # United States
+    "us": "us",
+    "usa": "us",
+    "united states": "us",
+    "america": "us",
+    # United Kingdom
+    "uk": "uk",
+    "gb": "uk",
+    "gbr": "uk",
+    "united kingdom": "uk",
+    "great britain": "uk",
+    "england": "uk",
+    # Vietnam
+    "vn": "vn",
+    "vnm": "vn",
+    "vietnam": "vn",
+    "越南": "vn",
+    # Thailand
+    "th": "th",
+    "tha": "th",
+    "thailand": "th",
+    "泰國": "th",
+}
+
+CANON_TO_ALIASES = {}
+for alias, canon in COUNTRY_ALIAS_TO_CANON.items():
+    CANON_TO_ALIASES.setdefault(canon, set()).add(alias)
+
+
+def _canonical_country_token(token: str) -> str | None:
+    try:
+        t = (token or "").strip().lower()
+    except Exception:
+        t = ""
+    if not t:
+        return None
+    return COUNTRY_ALIAS_TO_CANON.get(t, t)
+
+
+def _expand_country_synonyms(token: str) -> list[str]:
+    canon = _canonical_country_token(token)
+    if not canon:
+        return []
+    aliases = CANON_TO_ALIASES.get(canon, set())
+    # include the canonical itself as well
+    out = set(aliases)
+    out.add(canon)
+    return sorted(out)
 
 
 def _detect_metric_intent(query: str) -> Dict[str, Any] | None:
@@ -243,10 +347,25 @@ def _detect_metric_intent(query: str) -> Dict[str, Any] | None:
         if m:
             metric_token, metric_raw = norm_metric(m.group(1))
             if metric_token:
+                rank = 1
+                # detect ordinals around the phrase
+                ql = query.lower()
+                for ow, rv in ORDINAL_WORDS.items():
+                    if ow in ql:
+                        rank = rv
+                        break
+                # Chinese: 第N (e.g., 第2, 第二)
+                m_ord = re.search(r"第\s*(\d+)", query)
+                if m_ord:
+                    try:
+                        rank = int(m_ord.group(1))
+                    except Exception:
+                        pass
                 return {
                     'mode': 'max',
                     'metric': metric_token,
-                    'metric_raw': metric_raw
+                    'metric_raw': metric_raw,
+                    'rank': rank
                 }
 
         # 2) Mode first (min)
@@ -256,10 +375,23 @@ def _detect_metric_intent(query: str) -> Dict[str, Any] | None:
         if m:
             metric_token, metric_raw = norm_metric(m.group(1))
             if metric_token:
+                rank = 1
+                ql = query.lower()
+                for ow, rv in ORDINAL_WORDS.items():
+                    if ow in ql:
+                        rank = rv
+                        break
+                m_ord = re.search(r"第\s*(\d+)", query)
+                if m_ord:
+                    try:
+                        rank = int(m_ord.group(1))
+                    except Exception:
+                        pass
                 return {
                     'mode': 'min',
                     'metric': metric_token,
-                    'metric_raw': metric_raw
+                    'metric_raw': metric_raw,
+                    'rank': rank
                 }
 
         # 3) Metric first (max at end)
@@ -269,10 +401,23 @@ def _detect_metric_intent(query: str) -> Dict[str, Any] | None:
         if m:
             metric_token, metric_raw = norm_metric(m.group(1))
             if metric_token:
+                rank = 1
+                ql = query.lower()
+                for ow, rv in ORDINAL_WORDS.items():
+                    if ow in ql:
+                        rank = rv
+                        break
+                m_ord = re.search(r"第\s*(\d+)", query)
+                if m_ord:
+                    try:
+                        rank = int(m_ord.group(1))
+                    except Exception:
+                        pass
                 return {
                     'mode': 'max',
                     'metric': metric_token,
-                    'metric_raw': metric_raw
+                    'metric_raw': metric_raw,
+                    'rank': rank
                 }
 
         # 4) Metric first (min at end)
@@ -282,10 +427,23 @@ def _detect_metric_intent(query: str) -> Dict[str, Any] | None:
         if m:
             metric_token, metric_raw = norm_metric(m.group(1))
             if metric_token:
+                rank = 1
+                ql = query.lower()
+                for ow, rv in ORDINAL_WORDS.items():
+                    if ow in ql:
+                        rank = rv
+                        break
+                m_ord = re.search(r"第\s*(\d+)", query)
+                if m_ord:
+                    try:
+                        rank = int(m_ord.group(1))
+                    except Exception:
+                        pass
                 return {
                     'mode': 'min',
                     'metric': metric_token,
-                    'metric_raw': metric_raw
+                    'metric_raw': metric_raw,
+                    'rank': rank
                 }
 
     except Exception:
@@ -303,14 +461,17 @@ def preprocess_query_extract_keywords(query: str) -> Dict[str, Any]:
     if not query:
         return {"keywords_text": "", "product_code": None}
 
-    # Detect product code (normalize by removing '-')
+    # Detect product code (more flexible patterns)
     product_code = None
     try:
-        code_match = re.search(
-            r"\b([A-Za-z]?-?Q?\d{2,}|[A-Za-z]{2,}\-?\d{2,})\b", query,
-            re.IGNORECASE)
+        # Match patterns like: Q2, Q02, Q-2, Q-02, ABC2, ABC-2, etc.
+        code_match = re.search(r"\b([A-Za-z]+-?[0-9]+|[A-Za-z]?[0-9]+)\b",
+                               query, re.IGNORECASE)
         if code_match:
-            product_code = code_match.group(1).upper().replace('-', '')
+            raw_code = code_match.group(1).upper().replace('-', '')
+            # Only consider it a product code if it has both letters and numbers
+            if re.search(r'[A-Z]', raw_code) and re.search(r'[0-9]', raw_code):
+                product_code = raw_code
     except Exception:
         product_code = None
 
@@ -348,7 +509,7 @@ def _normalize_product_code(code: str) -> str:
     """Normalize product codes for comparison: uppercase, remove '-', drop leading zeros in numeric suffix.
 
     Examples:
-    - Q02 -> Q2; Q002 -> Q2; ABC-001 -> ABC1
+    - Q02 -> Q2; Q002 -> Q2; Q2 -> Q2; ABC-001 -> ABC1
     """
     if code is None:
         return ""
@@ -381,6 +542,15 @@ def parse_filters_string(filters_str: str) -> Dict[str, List[str]]:
                 if ':' in pair:
                     key, values = pair.split(':', 1)
                     key = key.strip()
+                    # Normalize aliases
+                    kl = key.lower()
+                    if kl in ["category", "industry_category", "industry"]:
+                        key = "industry_category"
+                    elif kl in [
+                            "country", "nation", "國家", "國別", "address", "addr",
+                            "location", "location_addr"
+                    ]:
+                        key = "country"
                     values = [
                         v.strip() for v in values.split(',') if v.strip()
                     ]
@@ -407,18 +577,73 @@ async def semantic_search(request: SearchRequest):
     """
     try:
         # Extract parameters from request
-        query = request.query_text
-        filters_str = request.filters
-        top_k = request.top_k
+        query = request.query_text  # Prefer new k_top, then legacy t_top, then default top_k
+        filters_str = getattr(request, 'filters', None)
+        top_k = (getattr(request, 'k_top', None)
+                 if hasattr(request, 'k_top') else None)
+        if top_k is None:
+            top_k = (getattr(request, 't_top', None) if hasattr(
+                request, 't_top') else None)
+        if top_k is None:
+            top_k = request.top_k
+        # Guard against non-positive values
+        try:
+            if int(top_k) <= 0:
+                top_k = request.top_k
+        except Exception:
+            top_k = request.top_k
         print(f"Query: {query}")
-        # Parse filters string to dictionary
-        filters = parse_filters_string(filters_str)
+        # Build filters from new input style first, fallback to legacy string
+        filters: Dict[str, List[str]] = {}
+        try:
+            # Primary fields
+            ind = getattr(request, 'industry', None)
+            ctry = getattr(request, 'country', None)
+            if ind:
+                inds = ind if isinstance(ind, list) else [ind]
+                filters['industry_category'] = [
+                    str(c).strip() for c in inds if str(c).strip()
+                ]
+            if ctry:
+                ctrs = ctry if isinstance(ctry, list) else [ctry]
+                filters['country'] = [
+                    str(c).strip() for c in ctrs if str(c).strip()
+                ]
+
+        except Exception:
+            filters = {}
+
+        # Enforce both category and country must be provided
+        industry_vals = filters.get("industry_category") or filters.get(
+            "industry") or []
+        country_vals = filters.get("country") or []
+        if not industry_vals or not country_vals:
+            raise HTTPException(
+                status_code=400,
+                detail=
+                "Both category and country filters are required (e.g., category:XXX;country:YYY)"
+            )
 
         # Preprocess query to extract keywords and detect product code
         qp = preprocess_query_extract_keywords(query)
         product_code = qp.get("product_code")
         query_for_embedding = qp.get("keywords_text") or query
         metric_intent = qp.get("metric_intent")
+        # Company list intent: list all companies in current filter context
+        company_list_intent = False
+        try:
+            if re.search(
+                    r"\b(list|show)\b.*\b(companies|company|suppliers?)\b",
+                    query, re.IGNORECASE):
+                company_list_intent = True
+            if re.search(r"(列出|清單|所有).*(公司|廠商)", query):
+                company_list_intent = True
+            if re.fullmatch(r"\s*(list\s*all)\s*", query, re.IGNORECASE):
+                company_list_intent = True
+            if re.fullmatch(r"\s*(all\s*list)\s*", query, re.IGNORECASE):
+                company_list_intent = True
+        except Exception:
+            company_list_intent = False
 
         # Step 1: Filter VectorDB by filter values first
         filtered_groups = await filter_vectordb_by_filters(filters)
@@ -426,15 +651,106 @@ async def semantic_search(request: SearchRequest):
         if not filtered_groups:
             return {"results": []}
 
-        # Step 2: Generate embedding using preprocessed keywords
+        # Step 2: If listing companies, aggregate without embedding
+        if company_list_intent:
+            # Aggregate across filtered groups
+            seen: Dict[str, str] = {}
+
+            def add_company(name: str):
+                if not name:
+                    return
+                norm = str(name).strip()
+                if not norm or norm.lower() == 'unknown company':
+                    return
+                norm = re.sub(r"\s+", " ", norm)
+                key = norm.lower()
+                if key not in seen:
+                    seen[key] = norm  # preserve first-seen casing
+
+            for vector_entry in filtered_groups:
+                md = vector_entry.metadata_json or {}
+                # product_metrics preferred
+                for m in (md.get('product_metrics') or []):
+                    add_company(m.get('company'))
+                # data_sample fallback
+                for rec in (md.get('data_sample') or []):
+                    add_company(
+                        rec.get('客戶名稱') or rec.get('公司名稱')
+                        or rec.get('company_name') or rec.get('company'))
+                # direct metadata fallback
+                add_company(
+                    md.get('客戶名稱') or md.get('公司名稱') or md.get('company_name')
+                    or md.get('company'))
+
+            companies = sorted(seen.values(), key=lambda s: s.lower())
+            return {"companies": companies}
+
+        # Step 2.5: Intent - show all information about X (company or product)
+        show_all_intent = False
+        target_name = None
+        try:
+            m = re.search(r"show\s+all\s+the\s+information\s+about\s+(.+)$",
+                          query, re.IGNORECASE)
+            if not m:
+                m = re.search(
+                    r"(顯示|查看|列出).*(全部|所有).*(資訊|信息|資料).*(關於|關於)?\s*([\w\u4e00-\u9fff\- ]+)",
+                    query)
+                if m:
+                    target_name = m.group(len(m.groups()))
+            else:
+                target_name = m.group(1)
+            if target_name:
+                target_name = target_name.strip().strip('"\'')
+                show_all_intent = True
+        except Exception:
+            show_all_intent = False
+
+        # If show-all intent, return full records for matching product/company within filtered groups
+        if show_all_intent and target_name:
+            target_l = target_name.lower()
+            matches: List[Dict[str, Any]] = []
+            for ve in filtered_groups:
+                md = ve.metadata_json or {}
+                # search product_metrics first
+                for mrec in (md.get('product_metrics') or []):
+                    pid = str(mrec.get('product_id') or '').lower()
+                    cname = str(mrec.get('company') or '').lower()
+                    if target_l in pid or target_l in cname:
+                        matches.append({
+                            "vector_id": ve.id,
+                            "industry": ve.filter,
+                            "record": mrec
+                        })
+                # also check data_sample
+                for rec in (md.get('data_sample') or []):
+                    rec_s = " ".join([
+                        str(v) for v in rec.values() if v is not None
+                    ]).lower()
+                    if target_l and target_l in rec_s:
+                        matches.append({
+                            "vector_id": ve.id,
+                            "industry": ve.filter,
+                            "record": rec
+                        })
+
+            if not matches:
+                raise HTTPException(
+                    status_code=404,
+                    detail=
+                    "No matching product or company found for show-all request within the selected category"
+                )
+
+            return {"matches": matches}
+
+        # Step 3: Generate embedding using preprocessed keywords
         query_embedding = await generate_embedding(query_for_embedding)
 
-        # Step 3: Perform semantic search within filtered groups
+        # Step 4: Perform semantic search within filtered groups
         vector_results = await semantic_search_within_groups(
             query, query_embedding, filtered_groups, top_k, product_code,
-            metric_intent)
+            metric_intent, filters)
 
-        # Step 4: Convert to response format
+        # Step 5: Convert to response format
         formatted_results = []
         vector_ids = []
 
@@ -517,22 +833,35 @@ async def filter_vectordb_by_filters(
                     # Apply industry filter (both "industry" and "industry_category" keys)
                     industry_filters = filters.get(
                         "industry", []) + filters.get("industry_category", [])
-                    if industry_filters:
-                        industry_conditions = []
-                        for industry in industry_filters:
-                            # Use string matching since filter is String type
-                            industry_conditions.append(
-                                VectorDB.filter.ilike(f"%{industry}%"))
-                        stmt = stmt.where(or_(*industry_conditions))
+                    country_filters = filters.get("country", [])
 
-                    # Apply country filter (if country info is stored in metadata)
-                    if filters.get("country"):
+                    # If both industry and country are provided, narrow by both
+                    if industry_filters and country_filters:
+                        industry_conditions = [
+                            VectorDB.filter.ilike(f"%{industry}%")
+                            for industry in industry_filters
+                        ]
+                        country_conditions = [
+                            # match the pipe-delimited country segment if present
+                            VectorDB.filter.ilike(f"%|{country}%")
+                            for country in country_filters
+                        ]
+                        stmt = stmt.where(or_(*industry_conditions)).where(
+                            or_(*country_conditions))
+                    elif industry_filters:
+                        industry_conditions = [
+                            VectorDB.filter.ilike(f"%{industry}%")
+                            for industry in industry_filters
+                        ]
+                        stmt = stmt.where(or_(*industry_conditions))
+                    elif country_filters:
                         country_conditions = []
-                        for country in filters["country"]:
-                            country_conditions.append(
-                                VectorDB.metadata_json.op('->>')(
-                                    'country').ilike(f"%{country}%"))
-                        stmt = stmt.where(or_(*country_conditions))
+                        for country in country_filters:
+                            for syn in _expand_country_synonyms(country):
+                                country_conditions.append(
+                                    VectorDB.filter.ilike(f"%|{syn}%"))
+                        if country_conditions:
+                            stmt = stmt.where(or_(*country_conditions))
 
                     # Execute query
                     result = await session.execute(stmt)
@@ -568,7 +897,8 @@ async def semantic_search_within_groups(
         filtered_groups: List[VectorDB],
         top_k: int,
         product_code: str = None,
-        metric_intent: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        metric_intent: Dict[str, Any] = None,
+        filters: Dict[str, List[str]] | None = None) -> List[Dict[str, Any]]:
     """
     Step 2: Perform semantic search within the filtered groups.
     Returns ranked results based on semantic similarity.
@@ -576,6 +906,13 @@ async def semantic_search_within_groups(
     results = []
 
     # Calculate similarity for each filtered group
+    country_filters = (filters or {}).get("country", [])
+    country_norms = {
+        c
+        for c in (_canonical_country_token(x) for x in country_filters) if c
+    }
+    any_country_required = len(country_norms) > 0
+
     for vector_entry in filtered_groups:
         # Calculate cosine similarity
         similarity = calculate_cosine_similarity(query_embedding,
@@ -584,20 +921,71 @@ async def semantic_search_within_groups(
         # Get metadata
         metadata = vector_entry.metadata_json or {}
 
+        # Validate country presence inside this group if required
+        if any_country_required:
+            countries_md = set()
+            for m in (metadata.get('product_metrics') or []):
+                cval = m.get('country')
+                if cval:
+                    try:
+                        cc = _canonical_country_token(cval)
+                        if cc:
+                            countries_md.add(cc)
+                    except Exception:
+                        pass
+            for c in (metadata.get('countries') or []):
+                try:
+                    cc = _canonical_country_token(c)
+                    if cc:
+                        countries_md.add(cc)
+                except Exception:
+                    pass
+            for rec in (metadata.get('data_sample') or []):
+                for k, v in rec.items():
+                    try:
+                        kl = str(k).lower()
+                        if any(x in kl for x in [
+                                "country", "國家", "國別", "地址", "address", "addr",
+                                "所在地"
+                        ]):
+                            s = _canonical_country_token(v)
+                            if s:
+                                countries_md.add(s)
+                    except Exception:
+                        continue
+            if countries_md and not (countries_md & country_norms):
+                # Skip this group entirely if it has country info and does not match
+                # If no country info at all, we won't skip here; we'll validate later
+                continue
+
         # Debug: Print metadata structure to understand the data
         print(
-            f"Debug - Metadata keys: {list(metadata.keys()) if metadata else 'Empty metadata'}"
+            f"Debug - Metadata keys in semantic: {list(metadata.keys()) if metadata else 'Empty metadata'}"
         )
         print(f"Debug - Filter value: {vector_entry.filter}")
 
-        # Get completeness score from metadata (already calculated in upload.py)
-        completeness = metadata.get('average_score', 0.5)
+        # Get completeness score for the group (will be overridden for individual products)
+        # Use average_score as group-level completeness
+        completeness = 0.5
+        try:
+            avg = metadata.get('average_score')
+            if isinstance(avg, (int, float)):
+                completeness = float(avg)
+            else:
+                indiv = metadata.get('individual_scores') or []
+                indiv_floats = [
+                    float(x) for x in indiv if isinstance(x, (int, float))
+                ]
+                if indiv_floats:
+                    completeness = float(np.mean(indiv_floats))
+        except Exception:
+            completeness = 0.5
 
-        # Determine document status
+        # Determine document status (will be updated later with matched product)
         doc_status = determine_document_status_from_metadata(metadata)
 
         # Calculate overall score
-        overall_score = (completeness * 0.6 + similarity * 0.4)
+        overall_score = (completeness * 0.54 + similarity * 0.3)
         #  100 * numeric_fit * 0.0)
 
         # Extract company name from data_sample array
@@ -647,7 +1035,7 @@ async def semantic_search_within_groups(
                 p2c = metadata.get('product_to_company') or {}
                 matched_company = p2c.get(matched_product)
                 # Apply a boost to overall score to favor exact product matches
-                overall_score += 0.2
+                overall_score += 0.2 * 0.4
 
         # If a metric intent is specified, pick best product in this group
         if metric_intent:
@@ -687,20 +1075,52 @@ async def semantic_search_within_groups(
                                 return v
                     return None
 
+                # If a product_code was provided but didn't resolve to an exact
+                # match above, treat it as a prefix filter (e.g., "Q012*"), and
+                # restrict metric aggregation to those products first.
+                filtered_metrics = metrics
+                if product_code:
+                    try:
+                        normalized_query = _normalize_product_code(
+                            product_code)
+                        prefixed = []
+                        for m in metrics:
+                            pid = m.get('product_id') or m.get('product')
+                            if pid and _normalize_product_code(pid).startswith(
+                                    normalized_query):
+                                prefixed.append(m)
+                        if prefixed:
+                            filtered_metrics = prefixed
+                    except Exception:
+                        # On any error, fall back to original metrics list
+                        filtered_metrics = metrics
+
                 enriched = []
-                for m in metrics:
+                for m in filtered_metrics:
                     val = resolve_value(m)
                     if val is not None:
                         enriched.append((m, float(val)))
 
                 if enriched:
                     reverse = metric_intent.get('mode') == 'max'
-                    best = sorted(enriched,
-                                  key=lambda t: t[1],
-                                  reverse=reverse)[0][0]
-                    matched_product = best.get('product_id') or matched_product
-                    matched_company = best.get('company') or matched_company
-                    overall_score += 0.15
+                    rank = max(1, int(metric_intent.get('rank') or 1))
+                    sorted_list = sorted(enriched,
+                                         key=lambda t: t[1],
+                                         reverse=reverse)
+                    if rank <= len(sorted_list):
+                        chosen = sorted_list[rank - 1][0]
+                    else:
+                        chosen = sorted_list[-1][0]
+                    matched_product = chosen.get(
+                        'product_id') or matched_product
+                    matched_company = chosen.get('company') or matched_company
+                    # slight boost when honoring metric intent rank
+                    overall_score += 0.15 * 0.4
+
+        # Update document status based on matched product if available
+        if matched_product:
+            doc_status = determine_document_status_from_metadata(
+                metadata, matched_product)
 
         results.append({
             "company_name": company_name,
@@ -730,7 +1150,9 @@ async def semantic_search_within_groups(
                 "product_metrics":
                 metadata.get('product_metrics', []),
                 "filter":
-                vector_entry.filter
+                vector_entry.filter,
+                "countries":
+                metadata.get('countries', [])
             }
         })
 
@@ -758,30 +1180,52 @@ async def semantic_search_within_groups(
                 "semantic_similarity":
                 r['semantic_similarity'],
                 "overall_score":
-                r['overall_score'] + 0.05,  # slight preference to direct match
+                r['overall_score'] +
+                0.05 * 0.4,  # slight preference to direct match
                 "metadata":
                 r["metadata"],
             })
         elif pm:
-            # Add top few products from this group by quality_score to diversify
+            # Add products from this group by quality_score to diversify
+            # Use all available products, not limited to 3
             top_products = sorted(pm,
                                   key=lambda m: (m.get('quality_score') or 0),
-                                  reverse=True)[:3]
+                                  reverse=True)[:top_k]
             for m in top_products:
+                # Get individual product completeness score
+                item_completeness = m.get('score') if isinstance(
+                    m.get('score'), (int, float)) else r['completeness_score']
+
+                # Calculate individual product document status
+                product_metadata = {
+                    'product_metrics': [m],
+                    'data_sample': [
+                        rec for rec in (metadata.get('data_sample') or [])
+                        if (rec.get('問卷編號') or rec.get('product_id')
+                            or rec.get('product')) == m.get('product_id')
+                    ]
+                }
+                product_doc_status = determine_document_status_from_metadata(
+                    product_metadata)
+
+                # Calculate individual product overall score
+                # Use group semantic similarity but individual completeness
+                individual_overall_score = (item_completeness * 0.54 +
+                                            r['semantic_similarity'] * 0.3)
+
                 expanded.append({
                     "company_name":
                     m.get('company') or r.get('company_name'),
                     "product_name":
                     m.get('product_id') or r.get('product_name'),
                     "document_status":
-                    r['document_status'],
+                    product_doc_status,  # Individual product status
                     "completeness_score":
-                    r['completeness_score'],
+                    item_completeness,  # Individual product completeness
                     "semantic_similarity":
-                    r['semantic_similarity'],
+                    r['semantic_similarity'],  # Group semantic similarity
                     "overall_score":
-                    r['overall_score'] -
-                    0.01,  # small demotion vs group winner
+                    individual_overall_score,  # Individual product overall score
                     "metadata":
                     r["metadata"],
                 })
@@ -800,6 +1244,41 @@ async def semantic_search_within_groups(
 
     # Sort again after expansion
     deduped.sort(key=lambda x: x['overall_score'], reverse=True)
+
+    # Apply country filter at result level and enforce validation if requested
+    if any_country_required:
+        filtered = []
+        for item in deduped:
+            md = item.get('metadata', {})
+            in_country = False
+            pm = md.get('product_metrics') or []
+            pname = item.get('product_name')
+            for m in pm:
+                try:
+                    if (m.get('product_id') == pname
+                        ) and m.get('country') and _canonical_country_token(
+                            m.get('country')) in country_norms:
+                        in_country = True
+                        break
+                except Exception:
+                    continue
+            if not in_country:
+                for c in (md.get('countries') or []):
+                    try:
+                        if _canonical_country_token(c) in country_norms:
+                            in_country = True
+                            break
+                    except Exception:
+                        continue
+            if in_country:
+                filtered.append(item)
+
+        if not filtered:
+            raise HTTPException(
+                status_code=404,
+                detail=
+                "No data for requested country within the selected category")
+        return filtered[:top_k]
 
     # Return only the top_k items
     return deduped[:top_k]
@@ -867,39 +1346,147 @@ def calculate_numeric_fit_from_metadata(query: str,
 
 
 def determine_document_status_from_metadata(metadata: Dict[str, Any]) -> str:
-    """Determine document status based on expire date."""
+    """Determine document status by scanning expire dates from products.
+    
+    Strategy:
+    - Collect candidate dates from `product_metrics` and `data_sample`
+    - Parse robustly (strings, Excel serials, datetime/date)
+    - If ANY date is expired, return "過期", otherwise "有效"
+    - Default to "過期" if nothing parseable is found
+    """
     from datetime import datetime, date
+    import re
+    import pandas as pd
 
-    data_sample = metadata.get('data_sample', [])
+    def parse_any_date(value):
+        try:
+            # Normalize strings like "2025- 9-10"
+            if isinstance(value, str):
+                value = re.sub(r"\s+", " ", value.strip())
+                value = value.replace("- ", "-").replace(" -", "-")
+            # Already date/datetime
+            if isinstance(value, datetime):
+                return value.date()
+            if isinstance(value, date):
+                return value
+            # Excel serial (numeric)
+            if isinstance(value, (int, float)) and not pd.isna(value):
+                excel_epoch = datetime(1899, 12, 30)
+                if 1 <= float(value) <= 2958465:
+                    return (excel_epoch +
+                            pd.Timedelta(days=float(value))).date()
+            # Pandas fallback
+            ts = pd.to_datetime(str(value), errors='coerce')
+            if pd.notna(ts) and getattr(ts, 'year', 0) > 1900:
+                return ts.date()
+        except Exception:
+            return None
+        return None
 
-    if data_sample and len(data_sample) > 0:
-        # Check expire date from the first record
-        first_record = data_sample[0]
-        expire_date_str = first_record.get('expire_date')
+    def collect_candidate_dates(md: Dict[str, Any]) -> list[date]:
+        candidates: list[date] = []
+        keys = ['expire_date', '到期', '有效期', '截止', '截止日']
 
-        if expire_date_str:
-            try:
-                # Parse the expire date (assuming format like "2026-07-05")
-                expire_date = datetime.strptime(expire_date_str,
-                                                '%Y-%m-%d').date()
-                today = date.today()
+        print(f"Debug - Scanning products for expire dates...")
 
-                if expire_date >= today:
-                    return "有效"
-                else:
-                    return "過期"
-            except (ValueError, TypeError):
-                # If date parsing fails, return default
-                return "有效"
+        # From product_metrics
+        product_metrics = md.get('product_metrics', [])
+        print(f"Debug - Checking {len(product_metrics)} product metrics")
 
-    # Default to valid if no expire date found
-    return "有效"
+        for i, pm in enumerate(product_metrics):
+            print(f"Debug - Product metric {i} keys: {list(pm.keys())}")
+            # top-level
+            top = pm.get('expire_date')
+            if top is not None:
+                print(f"Debug - Found top-level expire_date: {top}")
+                d = parse_any_date(top)
+                if d:
+                    candidates.append(d)
+                    print(f"Debug - Parsed top-level date: {d}")
+            # fields
+            fields = pm.get('fields', {})
+            print(f"Debug - Fields keys: {list(fields.keys())}")
+            for k, v in fields.items():
+                try:
+                    if any(x in str(k).lower() for x in keys):
+                        print(f"Debug - Found date field '{k}': {v}")
+                        d = parse_any_date(v)
+                        if d:
+                            candidates.append(d)
+                            print(f"Debug - Parsed field date: {d}")
+                except Exception as e:
+                    print(f"Debug - Error processing field {k}: {e}")
+                    continue
+
+        # From data_sample
+        data_sample = md.get('data_sample', [])
+        print(f"Debug - Checking {len(data_sample)} data sample records")
+
+        for i, rec in enumerate(data_sample):
+            print(f"Debug - Data sample {i} keys: {list(rec.keys())}")
+            for k, v in (rec or {}).items():
+                try:
+                    if any(x in str(k).lower() for x in keys):
+                        print(
+                            f"Debug - Found date field in data_sample '{k}': {v}"
+                        )
+                        d = parse_any_date(v)
+                        if d:
+                            candidates.append(d)
+                            print(f"Debug - Parsed data_sample date: {d}")
+                except Exception as e:
+                    print(
+                        f"Debug - Error processing data_sample field {k}: {e}")
+                    continue
+
+        print(
+            f"Debug - Collected {len(candidates)} candidate dates: {candidates}"
+        )
+        return candidates
+
+    try:
+        dates = collect_candidate_dates(metadata or {})
+        if not dates:
+            print("Debug - No valid dates found, defaulting to 有效")
+            return "過期"
+
+        today = date.today()
+        print(f"Debug - Today: {today}")
+
+        # Check each date individually
+        valid_dates = []
+        expired_dates = []
+
+        for d in dates:
+            if d >= today:
+                valid_dates.append(d)
+                print(f"Debug - Date {d} is valid (>= today)")
+            else:
+                expired_dates.append(d)
+                print(f"Debug - Date {d} is expired (< today)")
+
+        print(f"Debug - Valid dates: {valid_dates}")
+        print(f"Debug - Expired dates: {expired_dates}")
+
+        # If ANY date is expired, the document status is expired
+        if expired_dates:
+            print("Debug - Document status: 過期 (has expired dates)")
+            return "過期"
+        else:
+            print("Debug - Document status: 有效 (all dates valid)")
+            return "有效"
+
+    except Exception as e:
+        print(f"Debug - Exception in document status: {e}")
+        import traceback
+        traceback.print_exc()
+        return "有效"
 
 
 async def generate_embedding(text: str) -> List[float]:
     """Generate embedding for the given text using OpenAI API."""
     try:
-        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
         response = client.embeddings.create(model="text-embedding-3-small",
                                             input=text)
@@ -916,7 +1503,7 @@ async def get_search_history(limit: int = Query(
     10, description="Number of recent searches to return")):
     """Get recent search history."""
     try:
-        async for session in get_session():
+        async for session in async_session():
             from database.database import SearchQuery
             from sqlalchemy import desc
 
@@ -944,7 +1531,7 @@ async def get_search_history(limit: int = Query(
 async def get_search_results(query_id: str):
     """Get results for a specific search query."""
     try:
-        async for session in get_session():
+        async for session in async_session():
             from database.database import SearchQuery, SearchResult as ORMSearchResult
 
             # Get the query
@@ -1000,7 +1587,7 @@ async def save_search_query_and_results(
     query_id = str(uuid.uuid4())
     created_at = datetime.now().isoformat()
 
-    async for session in get_session():
+    async for session in async_session():
         try:
             # Save the search query
             search_query = SearchQuery(id=query_id,

@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, Integer, String, JSON, Float, ForeignKey, Boolean, text
+from sqlalchemy import Column, Integer, String, JSON, Float, ForeignKey, Boolean, text, ARRAY
 from pgvector.sqlalchemy import Vector
 import os
 from dotenv import load_dotenv
@@ -53,12 +53,44 @@ async_session = sessionmaker(engine,
 
 Base = declarative_base()
 
+
+class Companies(Base):
+    __tablename__ = "Companies"
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    industry = Column(String, nullable=False)
+    location = Column(String, nullable=False)
+    capital_amount = Column(Integer, nullable=False)
+    revenue = Column(Integer, nullable=False)
+    Company_certification_documents = Column(String, nullable=False)
+    patent = Column(Boolean, nullable=False)
+    delivery_time = Column(Integer, nullable=False)
+    created_at = Column(String, nullable=False)
+    updated_at = Column(String, nullable=False)
+
+
+class Products(Base):
+    __tablename__ = "Products"
+    id = Column(String, primary_key=True, index=True)
+    Company_id = Column(String, ForeignKey("Companies.id"))
+    product_name = Column(String, nullable=False)
+    main_raw_materials = Column(String, nullable=False)
+    product_standard = Column(ARRAY(String), nullable=False)
+    technical_advantages = Column(String, nullable=False)
+    product_certifications = Column(ARRAY(String), nullable=False)
+    created_at = Column(String, nullable=False)
+    updated_at = Column(String, nullable=False)
+
+
 class VectorDB(Base):
     __tablename__ = "VectorDB"
     id = Column(String, primary_key=True, index=True)
-    filter = Column(String)
+    Product_id = Column(String, ForeignKey("Products.id"))
+    Company_id = Column(String, ForeignKey("Companies.id"))
     embedding = Column(Vector(1536))
     metadata_json = Column(JSON)
+    created_at = Column(String, nullable=False)
+    updated_at = Column(String, nullable=False)
 
 
 class SearchQuery(Base):
@@ -85,6 +117,7 @@ class SearchResult(Base):
                   nullable=False)  # Position in results (1, 2, 3, etc.)
     vector_id = Column(
         String, ForeignKey("VectorDB.id"))  # Reference to original vector
+    created_at = Column(String, nullable=False)
 
 
 class Feedback(Base):
@@ -96,6 +129,7 @@ class Feedback(Base):
 
     action_type = Column(String, nullable=False)
     timestamp = Column(String, nullable=False)
+    created_at = Column(String, nullable=False)
 
 
 async def init_db():

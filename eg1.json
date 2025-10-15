@@ -1,0 +1,37 @@
+[
+  {
+    "Company_Name": "xyz",
+    "Industry_category": "abc",
+    "Location": "US",
+    "capital_amount": 100000,
+    "Revenue": 100000,
+    "Company_certification_documents": "https://www.google.com",
+    "Product": {
+      "Product_Name": "Wafer AOI Inspection Module",
+      "Main_Raw_Materials": "Aluminum Frame, Optical Lens",
+      "Product_Standard": ["SEMI S2", "CE"],
+      "Technical_Advantages": "12-second full-surface inspection accuracy ±0.1μm",
+      "Product_Certification_Materials": ["ISO 9001", "CE"]
+    },
+    "Patent": true,
+    "Delivery_time": 10
+  },
+
+  {
+    "Company_Name": "xyz1",
+    "Industry_category": "abc1",
+    "Location": "US",
+    "capital_amount": 1000001,
+    "Revenue": 1000001,
+    "Company_certification_documents": "https://www.google.com",
+    "Product": {
+      "Product_Name": "Wafer AOI Inspection Module123",
+      "Main_Raw_Materials": "Aluminum Frame, Optical Lens",
+      "Product_Standard": ["SEMI S2"],
+      "Technical_Advantages": "12-second full-surface inspection accuracy ±0.1μm",
+      "Product_Certification_Materials": ["ISO 9001", "CE", "HACCP"]
+    },
+    "Patent": true,
+    "Delivery_time": 19
+  }
+]

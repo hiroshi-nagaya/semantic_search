@@ -1,0 +1,17 @@
+{
+  "Company_Name": String, 
+  "Industry_category": String,
+  "Location": String,
+  "capital_amount": Integer,
+  "Revenue": Integer,
+  "Company_certification_documents": String,  #URL
+  "Product":{
+      "Product_Name": String,
+      "Main_Raw_Materials": String,
+      "Product_Standard": Array[String],
+      "Technical_Advantages": String,
+      "Product_Certification_Materials": Array[String],
+   },
+  "Patent": Boolean,
+  "Delivery_time": Integer
+}

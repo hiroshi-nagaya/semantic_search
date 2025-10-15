@@ -2,58 +2,75 @@ import pandas as pd
 import uuid
 import json
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from database.database import VectorDB, async_session, get_session
+from database.database import Companies, Products, VectorDB, async_session, get_session
+from database.schemas import CompanyRequest, ProductRequest, VectorDBRequest
 from sqlalchemy import select
 from typing import List, Dict, Any
 import io
-import openai
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
-from datetime import date
+from datetime import date, datetime
 import numpy as np
+import math
+from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
 
 load_dotenv()
 
 router = APIRouter()
 
 
-def calculate_product_score(row: pd.Series, industry_category: str) -> float:
+def calculate_score(row: pd.Series) -> float:
     """
-    Calculate score for product data.
+    Calculate score for data.
     Start with 1.0, minus 0.05 for each empty column.
-    Minus 0.1 if expire date is before today or issue date is after today.
+    Handles scalars and list-like values safely.
     """
     score = 1.0
     empty_penalty = 0.05
-    date_penalty = 0.1
+
+    def is_empty(value: Any) -> bool:
+        # None or NaN
+        if value is None:
+            return True
+        try:
+            if pd.isna(value):
+                # pd.isna(list) raises, caught below
+                return True
+        except Exception:
+            pass
+
+        # List-like: empty or all items empty/whitespace
+        if isinstance(value, (list, tuple, set)):
+            if len(value) == 0:
+                return True
+            for item in value:
+                if item is None:
+                    continue
+                s = str(item).strip()
+                if s != "":
+                    return False
+            return True
+
+        # Numpy arrays
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return True
+            # Consider empty if all stringified items are empty
+            return all(str(v).strip() == "" for v in value.flatten())
+
+        # Scalar string/number
+        try:
+            return str(value).strip() == ""
+        except Exception:
+            return False
 
     # Check each column for empty values
     for column in row.index:
         value = row[column]
-        if pd.isna(value) or value == "" or str(value).strip() == "":
+        if is_empty(value):
             score -= empty_penalty
-
-    # Check date validation
-    today = date.today()
-
-    # Check expire date
-    if 'expire_date' in row.index and not pd.isna(row['expire_date']):
-        try:
-            expire_date = pd.to_datetime(row['expire_date']).date()
-            if expire_date < today:
-                score -= date_penalty
-        except:
-            pass  # If date parsing fails, skip penalty
-
-    # Check issue date
-    if 'issue_date' in row.index and not pd.isna(row['issue_date']):
-        try:
-            issue_date = pd.to_datetime(row['issue_date']).date()
-            if issue_date > today:
-                score -= date_penalty
-        except:
-            pass  # If date parsing fails, skip penalty
-
     return max(0.0, score)  # Ensure score doesn't go below 0
 
 
@@ -70,506 +87,443 @@ async def upload_file(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
     file_extension = filename.split('.')[-1] if '.' in filename else ''
 
-    if file_extension not in ['csv', 'xlsx', 'xls']:
-        raise HTTPException(status_code=400,
-                            detail="Only CSV and Excel files are supported")
-
-    try:
-        # Read file content
-        file_content = await file.read()
-        file_io = io.BytesIO(file_content)
-
-        # Read data based on file type
-        if file_extension == 'csv':
-            data = pd.read_csv(file_io)
-        else:  # Excel files
-            data = pd.read_excel(file_io)
-
-        products_processed, filters_processed = await process_product_data(
-            data, file_id)
-        return {
-            "message":
-            f"Successfully processed {products_processed} industry groups with embeddings",
-            "file_id": file_id,
-            "groups_processed": products_processed,
-            "filters": filters_processed,
-            "data_type": "product"
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500,
-                            detail=f"Error processing file: {str(e)}")
-
-
-async def process_product_data(data: pd.DataFrame,
-                               file_id: str) -> tuple[int, List[str]]:
-    """
-    Process product data from DataFrame, classify by industry category (產業別), and create embeddings.
-    Updates existing VectorDB entries or creates new ones as needed.
-    Returns the number of industry groups processed.
-    """
-    # Group data by industry category (產業別)
-    if '產業別' not in data.columns:
-        # If no industry category column, try to find similar columns
-        industry_columns = [
-            col for col in data.columns
-            if 'industry' in col.lower() or '產業' in col or '類別' in col
-        ]
-        if not industry_columns:
-            raise HTTPException(
-                status_code=400,
-                detail=
-                "Product data must contain an industry category column (e.g., '產業別', 'industry_category')"
-            )
-        industry_col = industry_columns[0]
-    else:
-        industry_col = '產業別'
-
-    # Group data by industry category
-    industry_groups = data.groupby(industry_col)
-    groups_processed = 0
-    filters_processed: List[str] = []
-
-    # Process each group and update VectorDB
-    for industry_category, group_data in industry_groups:
-        # Track filter value processed for response
-        try:
-            filters_processed.append(str(industry_category))
-        except Exception:
-            pass
-        # Calculate scores and collect per-product metrics for each record in the group
-        scores = []
-
-        # Try to locate common columns for products, company, quantity and tags once per group
-        product_cols_detect = [
-            col for col in group_data.columns
-            if any(k in str(col) for k in
-                   ["問卷編號", "產品編號", "產品代號", "product_id", "product", "sku"])
-        ]
-        company_cols_detect = [
-            col for col in group_data.columns
-            if any(k in str(col)
-                   for k in ["客戶名稱", "公司名稱", "company", "company_name"])
-        ]
-        quantity_cols_detect = [
-            col for col in group_data.columns
-            if any(k in str(col).lower() for k in ["數量", "quantity", "qty"])
-        ]
-        tags_cols_detect = [
-            col for col in group_data.columns
-            if any(k in str(col).lower() for k in ["tags", "tag", "標籤"])
-        ]
-
-        product_col_detect = product_cols_detect[
-            0] if product_cols_detect else None
-        company_col_detect = company_cols_detect[
-            0] if company_cols_detect else None
-        quantity_col_detect = quantity_cols_detect[
-            0] if quantity_cols_detect else None
-        tags_col_detect = tags_cols_detect[0] if tags_cols_detect else None
-
-        # Identify numeric columns (excluding obvious id/company columns)
-        id_like = {
-            c
-            for c in group_data.columns if any(
-                k in str(c).lower() for k in ["id", "編號", "代號", "問卷", "sku"])
-        }
-        company_like = {
-            c
-            for c in group_data.columns
-            if any(k in str(c).lower() for k in ["company", "公司", "客戶"])
-        }
-        ignore_cols = id_like.union(company_like)
-
-        numeric_fields = set()
-        for col in group_data.columns:
-            if col in ignore_cols:
-                continue
-            non_na = group_data[col].dropna().head(20)
-            if non_na.empty:
-                continue
-            parsable = 0
-            for v in non_na:
-                try:
-                    _ = float(v)
-                    parsable += 1
-                except Exception:
-                    pass
-            if parsable >= max(3, int(len(non_na) * 0.6)):
-                numeric_fields.add(str(col))
-
-        product_metrics = []
-
-        for index, row in group_data.iterrows():
-            score = calculate_product_score(row, industry_category)
-            scores.append(score)
-
-            pid_val = row.get(
-                product_col_detect) if product_col_detect else None
-            pid = None if pd.isna(pid_val) else str(pid_val).strip()
-
-            cname_val = row.get(
-                company_col_detect) if company_col_detect else None
-            cname = None if pd.isna(cname_val) else str(cname_val).strip()
-
-            quantity_val = None
-            if quantity_col_detect:
-                qv = row.get(quantity_col_detect)
-                try:
-                    if not pd.isna(qv):
-                        quantity_val = float(qv)
-                except Exception:
-                    quantity_val = None
-
-            tags_val = None
-            if tags_col_detect:
-                tv = row.get(tags_col_detect)
-                if not pd.isna(tv):
-                    tags_val = [
-                        t.strip() for t in str(tv).replace('|', ',').split(',')
-                        if t.strip()
-                    ]
-
-            if pid:
-                # Include all fields for flexible metric queries
-                fields = {}
-                for col in group_data.columns:
-                    val = row.get(col)
-                    if pd.isna(val):
-                        continue
-                    key = str(col).strip()
-                    try:
-                        if key in numeric_fields:
-                            fields[key.lower()] = float(val)
-                        else:
-                            fields[key.lower()] = str(val).strip()
-                    except Exception:
-                        fields[key.lower()] = str(val)
-
-                product_metrics.append({
-                    "product_id": pid,
-                    "company": cname,
-                    "quantity": quantity_val,
-                    "quality_score": float(score),
-                    "tags": tags_val or [],
-                    "fields": fields
-                })
-
-        # Calculate average score for the group
-        average_score = np.mean(scores) if scores else 1.0
-
-        # Create text content for embedding (include average score)
-        text_content = create_product_text_content(industry_category,
-                                                   group_data, average_score)
-
-        # Generate embedding
-        embedding = await generate_embedding(text_content)
-
-        # Create metadata
-        metadata = {
-            "industry_category": str(industry_category),
-            "file_id": file_id,
-            "record_count": len(group_data),
-            "average_score": float(average_score),
-            "individual_scores": [float(s) for s in scores],
-            "columns": list(group_data.columns),
-            "data_sample":
-            group_data.head(3).to_dict('records'),  # First 3 records as sample
-            "last_updated": pd.Timestamp.now().isoformat()
-        }
-
-        # Attach per-product metrics if available
-        if product_metrics:
-            metadata["product_metrics"] = product_metrics
-            if numeric_fields:
-                metadata["numeric_fields"] = [nf for nf in numeric_fields]
-
-        # Derive product identifiers and mapping to company names for better search resolution
-        try:
-            product_cols = [
-                col for col in group_data.columns if any(
-                    k in str(col) for k in
-                    ["問卷編號", "產品編號", "產品代號", "product_id", "product", "sku"])
-            ]
-            company_cols = [
-                col for col in group_data.columns
-                if any(k in str(col)
-                       for k in ["客戶名稱", "公司名稱", "company", "company_name"])
-            ]
-
-            product_col = product_cols[0] if product_cols else None
-            company_col = company_cols[0] if company_cols else None
-
-            product_ids: List[str] = []
-            product_to_company: Dict[str, str] = {}
-
-            if product_col:
-                for _, row in group_data.iterrows():
-                    pid_val = row.get(product_col)
-                    if pd.isna(pid_val):
-                        continue
-                    pid = str(pid_val).strip()
-                    if not pid:
-                        continue
-                    product_ids.append(pid)
-                    if company_col:
-                        cname_val = row.get(company_col)
-                        if not pd.isna(cname_val):
-                            product_to_company[pid] = str(cname_val).strip()
-
-            if product_ids:
-                # Keep unique order
-                seen = set()
-                unique_products = []
-                for p in product_ids:
-                    if p not in seen:
-                        unique_products.append(p)
-                        seen.add(p)
-
-                metadata["product_ids"] = unique_products
-                if product_to_company:
-                    metadata["product_to_company"] = product_to_company
-        except Exception:
-            # Non-fatal enrichment; ignore if any error occurs
-            pass
-
-        # Update or create VectorDB entry
-        await update_or_create_vector_entry(industry_category, embedding,
-                                            metadata)
-        groups_processed += 1
-
-    return groups_processed, filters_processed
-
-
-async def update_or_create_vector_entry(industry_category: str,
-                                        embedding: List[float],
-                                        metadata: dict):
-    """
-    Update existing VectorDB entry for the industry category or create a new one.
-    This ensures VectorDB is always up-to-date with the latest data.
-    """
-    async for session in get_session():
-        try:
-            # Check if entry exists for this industry category
-            stmt = select(VectorDB).where(VectorDB.filter == industry_category)
-            result = await session.execute(stmt)
-            existing_entry = result.scalar_one_or_none()
-
-            if existing_entry:
-                # Update existing entry
-                existing_entry.embedding = embedding
-                existing_entry.metadata_json = metadata
-                print(
-                    f"Updated VectorDB entry for industry: {industry_category}"
-                )
-            else:
-                # Create new entry
-                vector_entry = VectorDB(id=str(uuid.uuid4()),
-                                        filter=industry_category,
-                                        embedding=embedding,
-                                        metadata_json=metadata)
-                session.add(vector_entry)
-                print(
-                    f"Created new VectorDB entry for industry: {industry_category}"
-                )
-
-            await session.commit()
-
-        except Exception as e:
-            await session.rollback()
-            raise e
-
-
-def create_product_text_content(industry_category: str,
-                                group_data: pd.DataFrame,
-                                average_score: float) -> str:
-    """
-    Create text content from industry group data for embedding generation.
-    """
-    text_parts = [
-        f"Industry Category: {industry_category}",
-        f"Average Score: {average_score:.2f}"
-    ]
-
-    # Add all text data from the group
-    for column in group_data.columns:
-        if group_data[column].dtype == 'object':  # Text columns
-            unique_values = group_data[column].dropna().unique()
-            if len(unique_values) > 0:
-                text_parts.append(
-                    f"{column}: {', '.join(map(str, unique_values))}")
-
-    return " | ".join(text_parts)
-
-
-async def generate_embedding(text: str) -> List[float]:
-    """
-    Generate embedding for the given text using OpenAI API.
-    """
-    try:
-        # Initialize OpenAI client
-        client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        # Generate embedding
-        response = client.embeddings.create(model="text-embedding-3-small",
-                                            input=text)
-
-        return response.data[0].embedding
-
-    except Exception as e:
-        raise HTTPException(status_code=500,
-                            detail=f"Failed to generate embedding: {str(e)}")
-
-
-@router.post("/vectordb/refresh")
-async def refresh_vectordb():
-    """
-    Manually refresh all VectorDB entries by regenerating embeddings.
-    This can be useful if you want to update all existing entries with new embeddings.
-    """
-    try:
-        async for session in get_session():
-            # Get all existing VectorDB entries
-            stmt = select(VectorDB)
-            result = await session.execute(stmt)
-            vector_entries = result.scalars().all()
-
-            updated_count = 0
-            for entry in vector_entries:
-                try:
-                    # Regenerate embedding for existing text content
-                    metadata = entry.metadata_json or {}
-                    industry_category = entry.filter
-
-                    # Recreate text content from metadata
-                    text_content = f"Industry Category: {industry_category}"
-                    if 'average_score' in metadata:
-                        text_content += f" | Average Score: {metadata['average_score']:.2f}"
-                    if 'data_sample' in metadata and metadata['data_sample']:
-                        # Add sample data to text content
-                        sample_texts = []
-                        for sample in metadata[
-                                'data_sample'][:3]:  # First 3 samples
-                            for key, value in sample.items():
-                                if isinstance(value, str) and value.strip():
-                                    sample_texts.append(f"{key}: {value}")
-                        if sample_texts:
-                            text_content += " | " + " | ".join(sample_texts)
-
-                    # Generate new embedding
-                    new_embedding = await generate_embedding(text_content)
-
-                    # Update entry
-                    entry.embedding = new_embedding
-                    metadata['last_refreshed'] = pd.Timestamp.now().isoformat()
-                    entry.metadata_json = metadata
-
-                    updated_count += 1
-
-                except Exception as e:
-                    print(f"Failed to refresh entry {entry.id}: {e}")
-                    continue
-
-            await session.commit()
-
-        return {
-            "message":
-            f"Successfully refreshed {updated_count} VectorDB entries",
-            "entries_updated": updated_count
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500,
-                            detail=f"Failed to refresh VectorDB: {str(e)}")
-
-
-@router.get("/vectordb/stats")
-async def get_vectordb_stats():
-    """
-    Get statistics about the current VectorDB entries.
-    """
-    try:
-        async for session in get_session():
-            # Get all VectorDB entries
-            stmt = select(VectorDB)
-            result = await session.execute(stmt)
-            vector_entries = result.scalars().all()
-
-            # Calculate statistics
-            total_entries = len(vector_entries)
-            industry_categories = set(entry.filter for entry in vector_entries)
-
-            # Get metadata statistics
-            total_records = 0
-            avg_scores = []
-
-            for entry in vector_entries:
-                metadata = entry.metadata_json or {}
-                if 'record_count' in metadata:
-                    total_records += metadata['record_count']
-                if 'average_score' in metadata:
-                    avg_scores.append(metadata['average_score'])
-
-            avg_score = np.mean(avg_scores) if avg_scores else 0
-
-            return {
-                "total_vector_entries":
-                total_entries,
-                "unique_industry_categories":
-                len(industry_categories),
-                "industry_categories":
-                list(industry_categories),
-                "total_records_represented":
-                total_records,
-                "average_quality_score":
-                round(avg_score, 3),
-                "last_updated_entries": [
-                    {
-                        "industry":
-                        entry.filter,
-                        "last_updated":
-                        entry.metadata_json.get('last_updated', 'Unknown')
-                        if entry.metadata_json else 'Unknown'
-                    } for entry in vector_entries[-5:]  # Last 5 entries
-                ]
-            }
-
-    except Exception as e:
-        raise HTTPException(status_code=500,
-                            detail=f"Failed to get VectorDB stats: {str(e)}")
-
-
-@router.delete("/vectordb/industry/{industry_category}")
-async def delete_vectordb_entry(industry_category: str):
-    """
-    Delete VectorDB entry for a specific industry category.
-    """
-    try:
-        async for session in get_session():
-            # Find and delete the entry
-            stmt = select(VectorDB).where(VectorDB.filter == industry_category)
-            result = await session.execute(stmt)
-            entry = result.scalar_one_or_none()
-
-            if not entry:
-                raise HTTPException(
-                    status_code=404,
-                    detail=
-                    f"No VectorDB entry found for industry: {industry_category}"
-                )
-
-            await session.delete(entry)
-            await session.commit()
-
-            return {
-                "message":
-                f"Successfully deleted VectorDB entry for industry: {industry_category}",
-                "deleted_industry": industry_category
-            }
-
-    except HTTPException:
-        raise
-    except Exception as e:
+    # Read bytes once
+    file_bytes = await file.read()
+
+    # Decide parser by extension or content-type
+    is_json = file_extension in ["json"] or (file.content_type
+                                             and "json" in file.content_type)
+    is_tabular = file_extension in ["csv", "xlsx", "xls"]
+
+    if not (is_json or is_tabular):
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to delete VectorDB entry: {str(e)}")
+            status_code=400,
+            detail="Only CSV, Excel, or JSON files are supported")
+
+    try:
+        if is_json:
+            records = _parse_json_payload(file_bytes)
+        else:
+            records = _parse_tabular_payload(file_bytes, file_extension)
+    except Exception as e:
+        raise HTTPException(status_code=400,
+                            detail=f"Failed to parse file: {e}")
+
+    if not records:
+        return {
+            "status": "ok",
+            "message": "No records found",
+            "created": 0,
+            "updated": 0
+        }
+
+    # Upsert into DB
+    created_counts = {"companies": 0, "products": 0, "vectors": 0}
+    updated_counts = {"companies": 0, "products": 0, "vectors": 0}
+
+    # Ensure OpenAI API key present if embeddings required
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not openai_api_key:
+        raise HTTPException(status_code=500,
+                            detail="OPENAI_API_KEY is not set")
+
+    # OpenAI embeddings model
+    embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    async with async_session() as session:
+        try:
+            for rec in records:
+                company_res, company_created = await _upsert_company(
+                    session, rec)
+                if company_created:
+                    created_counts["companies"] += 1
+                else:
+                    updated_counts["companies"] += 1
+
+                product_res, product_created = await _upsert_product(
+                    session, company_res.id, rec)
+                if product_created:
+                    created_counts["products"] += 1
+                else:
+                    updated_counts["products"] += 1
+
+                # Build metadata and score
+                metadata, score = _build_metadata(rec)
+
+                # Create embedding text per item
+                embedding_text = _build_embedding_text(metadata)
+
+                # Call OpenAI for embedding (supports both old and new clients defensively)
+                embedding = await _create_embedding_async(
+                    embedding_text, embedding_model, openai_api_key)
+
+                vec_res, vec_created = await _upsert_vector(
+                    session,
+                    company_id=company_res.id,
+                    product_id=product_res.id,
+                    embedding=embedding,
+                    metadata=metadata)
+                if vec_created:
+                    created_counts["vectors"] += 1
+                else:
+                    updated_counts["vectors"] += 1
+
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+    # Update todos via return payload
+    total_created = sum(created_counts.values())
+    total_updated = sum(updated_counts.values())
+    return {
+        "status": "ok",
+        "file_id": file_id,
+        "created": created_counts,
+        "updated": updated_counts,
+        "total_created": total_created,
+        "total_updated": total_updated,
+    }
+
+
+def _parse_tabular_payload(file_bytes: bytes,
+                           file_extension: str) -> List[Dict[str, Any]]:
+    buffer = io.BytesIO(file_bytes)
+    if file_extension == "csv":
+        df = pd.read_csv(buffer)
+    else:
+        df = pd.read_excel(buffer)
+
+    # Normalize column names to lower snake for mapping
+    df.columns = [str(c).strip() for c in df.columns]
+
+    records: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        normalized = _normalize_row_from_tabular(row)
+        if normalized:
+            records.append(normalized)
+    return records
+
+
+def _parse_json_payload(file_bytes: bytes) -> List[Dict[str, Any]]:
+    payload = json.loads(file_bytes.decode("utf-8"))
+    items = payload if isinstance(payload, list) else [payload]
+    records: List[Dict[str, Any]] = []
+    for item in items:
+        normalized = _normalize_row_from_json(item)
+        if normalized:
+            records.append(normalized)
+    return records
+
+
+def _normalize_row_from_tabular(row: pd.Series) -> Dict[str, Any]:
+    get = lambda *keys: next((row.get(k) for k in keys
+                              if k in row and not (pd.isna(row.get(k)) or str(
+                                  row.get(k)).strip() == "")), None)
+
+    # Handle common variants from the screenshot/example
+    company_name = get("Company_Name", "company_name", "Company", "name")
+    industry = get("Industry_category", "Industry", "industry_category",
+                   "industry")
+    location = get("Location", "location")
+    capital_amount = get("Capital_Amour", "capital_amount", "Capital_amount")
+    revenue = get("Revenue", "revenue")
+    cert_docs = get("Company_Certification_Documents",
+                    "Company_certification_documents", "cert_docs")
+    product_name = get("Product_Name", "product_name")
+    main_raw_materials = get("Main_Raw_Materials", "main_raw_materials")
+    product_standard = get("Product_Standard", "product_standard")
+    technical_advantages = get("Technical_advantages", "technical_advantages")
+    product_certs = get("product_certifications",
+                        "Product_Certification_Materials")
+    patent = get("Patent", "patent")
+    delivery_time = get("Delivery_time", "delivery_time")
+
+    # Convert types
+    def to_int(v):
+        try:
+            return int(v) if v is not None and str(v).strip() != "" else None
+        except Exception:
+            return None
+
+    def to_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return None
+        s = str(v).strip().lower()
+        return s in ["true", "1", "yes", "y"]
+
+    def to_list(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return []
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            # split by commas or semicolons
+            parts = [
+                p.strip() for p in v.replace(";", ",").split(",")
+                if p.strip() != ""
+            ]
+            return parts
+        return [str(v)]
+
+    normalized = {
+        "company_name":
+        str(company_name).strip() if company_name is not None else None,
+        "industry_category":
+        str(industry).strip() if industry is not None else None,
+        "location":
+        str(location).strip() if location is not None else None,
+        "capital_amount":
+        to_int(capital_amount),
+        "revenue":
+        to_int(revenue),
+        "company_certification_documents":
+        str(cert_docs).strip() if cert_docs is not None else None,
+        "product_name":
+        str(product_name).strip() if product_name is not None else None,
+        "main_raw_materials":
+        str(main_raw_materials).strip()
+        if main_raw_materials is not None else None,
+        "product_standard":
+        to_list(product_standard),
+        "technical_advantages":
+        str(technical_advantages).strip()
+        if technical_advantages is not None else None,
+        "product_certifications":
+        to_list(product_certs),
+        "patent":
+        to_bool(patent),
+        "delivery_time":
+        to_int(delivery_time),
+    }
+    return normalized
+
+
+def _normalize_row_from_json(item: Dict[str, Any]) -> Dict[str, Any]:
+    # example.yaml structure
+    product = item.get("Product") or {}
+
+    def to_list(v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            return [
+                p.strip() for p in v.replace(";", ",").split(",") if p.strip()
+            ]
+        return [str(v)]
+
+    normalized = {
+        "company_name":
+        item.get("Company_Name") or item.get("company_name"),
+        "industry_category":
+        item.get("Industry_category") or item.get("industry")
+        or item.get("industry_category"),
+        "location":
+        item.get("Location") or item.get("location"),
+        "capital_amount":
+        item.get("capital_amount"),
+        "revenue":
+        item.get("Revenue") or item.get("revenue"),
+        "company_certification_documents":
+        item.get("Company_certification_documents")
+        or item.get("Company_Certification_Documents"),
+        "product_name":
+        product.get("Product_Name") or product.get("product_name"),
+        "main_raw_materials":
+        product.get("Main_Raw_Materials") or product.get("main_raw_materials"),
+        "product_standard":
+        to_list(
+            product.get("Product_Standard")
+            or product.get("product_standard")),
+        "technical_advantages":
+        product.get("Technical_Advantages")
+        or product.get("technical_advantages"),
+        "product_certifications":
+        to_list(
+            product.get("Product_Certification_Materials")
+            or product.get("product_certifications")),
+        "patent":
+        item.get("Patent") if isinstance(item.get("Patent"), bool) else str(
+            item.get("Patent")).lower() in ["true", "1", "yes", "y"],
+        "delivery_time":
+        item.get("Delivery_time") or item.get("delivery_time"),
+    }
+    return normalized
+
+
+async def _upsert_company(session: AsyncSession, rec: Dict[str, Any]):
+    now = datetime.utcnow().isoformat()
+    company_name = rec.get("company_name")
+    if not company_name:
+        raise HTTPException(status_code=400,
+                            detail="Missing company_name in a record")
+
+    result = await session.execute(
+        select(Companies).where(Companies.name == company_name))
+    existing = result.scalars().first()
+    if existing:
+        existing.industry = rec.get("industry_category") or existing.industry
+        existing.location = rec.get("location") or existing.location
+        if rec.get("capital_amount") is not None:
+            existing.capital_amount = rec["capital_amount"]
+        if rec.get("revenue") is not None:
+            existing.revenue = rec["revenue"]
+        if rec.get("company_certification_documents") is not None:
+            existing.Company_certification_documents = rec[
+                "company_certification_documents"]
+        if rec.get("patent") is not None:
+            existing.patent = bool(rec["patent"])
+        if rec.get("delivery_time") is not None:
+            existing.delivery_time = rec["delivery_time"]
+        existing.updated_at = now
+        return existing, False
+    else:
+        company = Companies(
+            id=str(uuid.uuid4()),
+            name=company_name,
+            industry=rec.get("industry_category") or "",
+            location=rec.get("location") or "",
+            capital_amount=rec.get("capital_amount") or 0,
+            revenue=rec.get("revenue") or 0,
+            Company_certification_documents=rec.get(
+                "company_certification_documents") or "",
+            patent=bool(rec.get("patent"))
+            if rec.get("patent") is not None else False,
+            delivery_time=rec.get("delivery_time") or 0,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(company)
+        return company, True
+
+
+async def _upsert_product(session: AsyncSession, company_id: str,
+                          rec: Dict[str, Any]):
+    now = datetime.utcnow().isoformat()
+    product_name = rec.get("product_name")
+    if not product_name:
+        # Create a shell product if no product fields? Skip instead.
+        raise HTTPException(status_code=400,
+                            detail="Missing product_name in a record")
+
+    result = await session.execute(
+        select(Products).where(Products.Company_id == company_id,
+                               Products.product_name == product_name))
+    existing = result.scalars().first()
+
+    standards = rec.get("product_standard") or []
+    certs = rec.get("product_certifications") or []
+    if isinstance(standards, str):
+        standards = [s for s in standards.split(",") if s.strip()]
+    if isinstance(certs, str):
+        certs = [s for s in certs.split(",") if s.strip()]
+
+    if existing:
+        existing.main_raw_materials = rec.get(
+            "main_raw_materials") or existing.main_raw_materials
+        existing.product_standard = standards or existing.product_standard
+        existing.technical_advantages = rec.get(
+            "technical_advantages") or existing.technical_advantages
+        existing.product_certifications = certs or existing.product_certifications
+        existing.updated_at = now
+        return existing, False
+    else:
+        product = Products(
+            id=str(uuid.uuid4()),
+            Company_id=company_id,
+            product_name=product_name,
+            main_raw_materials=rec.get("main_raw_materials") or "",
+            product_standard=standards,
+            technical_advantages=rec.get("technical_advantages") or "",
+            product_certifications=certs,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(product)
+        return product, True
+
+
+def _build_metadata(rec: Dict[str, Any]):
+    # Prepare pandas series for scoring
+    score_series = pd.Series({
+        k: rec.get(k)
+        for k in [
+            "company_name", "industry_category", "location", "product_name",
+            "main_raw_materials", "product_standard", "technical_advantages",
+            "product_certifications", "delivery_time"
+        ]
+    })
+    data_score = calculate_score(score_series)
+
+    metadata = {
+        "company_name": rec.get("company_name"),
+        "industry_category": rec.get("industry_category"),
+        "location": rec.get("location"),
+        "product_name": rec.get("product_name"),
+        "main_raw_materials": rec.get("main_raw_materials"),
+        "product_standard": rec.get("product_standard") or [],
+        "technical_advantages": rec.get("technical_advantages"),
+        "certifications": rec.get("product_certifications") or [],
+        "delivery_time": rec.get("delivery_time"),
+        "data_score": data_score,
+    }
+    return metadata, data_score
+
+
+def _build_embedding_text(metadata: Dict[str, Any]) -> str:
+    parts = [
+        metadata.get("company_name") or "",
+        metadata.get("industry_category") or "",
+        metadata.get("location") or "",
+        metadata.get("product_name") or "",
+        metadata.get("main_raw_materials") or "",
+        ", ".join(metadata.get("product_standard") or []),
+        metadata.get("technical_advantages") or "",
+        ", ".join(metadata.get("certifications") or []),
+    ]
+    return " | ".join([str(p) for p in parts if str(p).strip() != ""])
+
+
+async def _create_embedding_async(text: str, model: str,
+                                  api_key: str) -> List[float]:
+    """Create embeddings using OpenAI client in a background thread.
+    The OpenAI Python client methods are synchronous; we offload to a thread.
+    """
+    client = OpenAI(api_key=api_key)
+
+    def _sync_create() -> List[float]:
+        resp = client.embeddings.create(model=model, input=text)
+        return resp.data[0].embedding
+
+    return await asyncio.to_thread(_sync_create)
+
+
+async def _upsert_vector(session: AsyncSession, company_id: str,
+                         product_id: str, embedding: List[float],
+                         metadata: Dict[str, Any]):
+    now = datetime.utcnow().isoformat()
+    # Check if there is an existing vector for this product
+    result = await session.execute(
+        select(VectorDB).where(VectorDB.Product_id == product_id))
+    existing = result.scalars().first()
+    if existing:
+        existing.embedding = embedding
+        existing.metadata_json = metadata
+        existing.updated_at = now
+        return existing, False
+    else:
+        vector = VectorDB(
+            id=str(uuid.uuid4()),
+            Product_id=product_id,
+            Company_id=company_id,
+            embedding=embedding,
+            metadata_json=metadata,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(vector)
+        return vector, True
